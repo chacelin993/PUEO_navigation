@@ -31,27 +31,27 @@ classdef KF < handle
             else
                 integrator0=quaternion(1,0,0,0);
             end
-            quat = quatmultiply(integrator0, quat);
+            quat = quatmultiply(quat, integrator0);
+%             quat = quatmultiply(integrator0, quat);
             rot1 = quat2rotm(quat);
             obj.x(1:4) = compact(quat);
-
             dR = rot1*transpose(rot);
             Phi = eye(9);
             Phi(1:3,1:3) = dR.';
             Phi(4:6,1:3) = -1/2*rot*skew(a*dt^2);
             Phi(7:9,1:3) = -rot*skew(a*dt);
             Phi(4:6,7:9) = eye(3)*dt;
-            
             G = zeros(9,6);
             G(1:3,1:3) = -transpose(dR)*Jr(-w*dt)*dt;
             G(4:6,4:6) = -1/2*rot*dt^2;
             G(7:9,4:6) = -rot*dt;
             Q = eye(6,6);
             Q(1:3,1:3) = Q(1:3,1:3)*obj.sg2;
-            Q(1:3,1:3) = Q(1:3,1:3)*obj.sa2;
+            Q(4:6,4:6) = Q(4:6,4:6)*obj.sa2;
             obj.P = Phi*obj.P*transpose(Phi) + G*Q*transpose(G);
         end
         function update(obj, z, R) % this z is the measurement of GPS
+            z = z.';
             H = zeros(3,9);
             H(:,4:6) = eye(3);
             K = obj.P*H.'/(H*obj.P*H.' + R);
@@ -59,6 +59,7 @@ classdef KF < handle
             dq = [1;dx(1:3)/2];
             dq = dq/norm(dq);
             obj.x(1:4) = compact(quatmultiply(quaternion(dq.'),quaternion(obj.x(1:4).')));
+            % obj.x(1:4) = compact(quatmultiply(quaternion(obj.x(1:4).',quaternion(dq.'))));
             obj.x(5:10) = obj.x(5:10) + dx(4:9);
             obj.P = obj.P - K*H*obj.P;
         end
@@ -75,11 +76,12 @@ classdef KF < handle
 end
 function val = Jr(theta)
 theta_norm=norm(theta);
-n = theta/theta_norm; % rotation axis
-val = sin(theta_norm)/theta_norm * eye(3) + ...
-    (1 - sin(theta_norm)/theta_norm)*n*transpose(n) ...
-    - (1-cos(theta_norm))/theta_norm * skew(n);
-
+% n = theta/theta_norm; % rotation axis
+% val = sin(theta_norm)/theta_norm * eye(3) + ...
+%     (1 - sin(theta_norm)/theta_norm)*n*transpose(n) ...
+%     - (1-cos(theta_norm))/theta_norm * skew(n);
+val = eye(3) - (1 - cos(theta_norm))/theta_norm^2 * skew(theta) + ...
+    (theta_norm - sin(theta_norm))/theta_norm^3 * skew(theta)*skew(theta);
 end
 function val = skew(v)
 val = zeros(3,3);
