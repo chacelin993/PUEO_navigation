@@ -3,13 +3,14 @@ dt=1/fs;
 IMU = imuSensor('accel-gyro','SampleRate',fs);
 g=9.81;
 acc_specs=accelparams('MeasurementRange', 15*g, ...
-    'NoiseDensity',40e-6*g);
+    'NoiseDensity',40e-6*g*100); % *100 more noisy than the specs
 gyro_specs=gyroparams('MeasurementRange',deg2rad(430) ...
-    ,'NoiseDensity',deg2rad(0.3)/3600);
+    ,'NoiseDensity', deg2rad(0.3)/3600 *1000); % *100 more noisy than the specs
 IMU.Accelerometer=acc_specs;
 IMU.Gyroscope=gyro_specs;
 %% Defining ground truth and IMU output
-runtime=100;
+rng(10); % control the random number (seed)
+runtime=1000;
 N=runtime*fs;
 t = (0:(N-1))/IMU.SampleRate;
 accBody=zeros(N,3);
@@ -19,18 +20,19 @@ firstLoopNumSamples = N*0.4;
 secondLoopNumSamples = N*0.6;
 totalNumSamples = firstLoopNumSamples + secondLoopNumSamples;
 accBody(1:firstLoopNumSamples,1)=1;
-accBody(firstLoopNumSamples+1:end,1)=-1;
-accBody(1:firstLoopNumSamples,2)=-1;
-accBody(firstLoopNumSamples+1:end,2)=1;
-angVelBody(:,3) = 0;
-% angVelBody(1:firstLoopNumSamples,3)=0;
-% angVelBody(firstLoopNumSamples+1:end,3)=0;
-
+accBody(firstLoopNumSamples+1:end,1)=1;
+accBody(1:firstLoopNumSamples,2)=1;
+accBody(firstLoopNumSamples+1:end,2)=-1;
+% % angVelBody(:,3) = sin(0.01*t);
+% % angVelBody(:,2) = cos(0.01*t);
+angVelBody(1:firstLoopNumSamples,1)=0;
+angVelBody(firstLoopNumSamples+1:end,2)=0;
 [accReading,gyroReading]=IMU(accBody,angVelBody);
-accReading(:,3)=accReading(:,3) - g;
+%IMU adds g to z direction and flip all the signs of inputs for no good reasons
+accReading(:,3)=accReading(:,3)-g; 
 accReading=-accReading;
 traj = kinematicTrajectory('SampleRate',fs);
-[positionNED,orientationNED,velocityNED,accNED,angVelNED] = traj(accBody,angVelBody);
+[pos_GT,quat_GT,vel_GT,~,~] = traj(accBody,angVelBody);
 
 % accReading(1:20,:)
 %% March time
@@ -52,44 +54,87 @@ end
 
 %% Raw
 traj1 = kinematicTrajectory('SampleRate',fs);
-[positionRaw,orientationRaw,velocityRaw,accRaw,angVelRaw] = traj1(accReading,gyroReading);
-
+[pos_raw,quat_raw,vel_raw,~,~] = traj1(accReading,gyroReading);
+% [pos_raw,quat_raw,vel_raw,~,~] = traj1(accBody,angVelBody);
 %% KF
 kf=KF();
-kf.sg2 = power(IMU.Gyroscope.NoiseDensity(1),2)*fs;
-kf.sa2 = power(IMU.Accelerometer.NoiseDensity(1),2)*fs;
+% for unknown reasons the std reading from IMU about 0.705 of the set noise density
+kf.sg2 = power(IMU.Gyroscope.NoiseDensity(1)*sqrt(fs)*0.705,2);
+kf.sa2 = power(IMU.Accelerometer.NoiseDensity(1)*sqrt(fs)*0.705,2);
 kf.g=[0;0;0];
 kf.x=zeros(10,1);
 kf.x(1)=1;
 kf.P = zeros(9,9);
-rng(1); % control the random number (seed)
-quat=zeros(N,4);
+% kf.P(1:3,1:3) = eye(3)*kf.sg2;
+
+quat_KF=zeros(N,4);
 pos=zeros(N,3);
 vel=zeros(N,3);
-err_v=zeros(N,3);
 err_p=zeros(N,3);
-z_gps=zeros(3,N);
-for i=1:N
-    quat(i,:) = kf.q;
+err_v=zeros(N,3);
+err_q=zeros(N,3);
+z_gps=zeros(N,7); % first 4 is quaternion, last 3 is position
+z_gps(1,1) = 1;
+R_gps = ones(6,1);
+R_gps(1:3) = power(0.1/180*pi,2); % error in gps attitude 0.1 degrees
+R_gps(4:6) = power(0.5,2); % error in gps position
+R_gps = diag(R_gps);
+for i=1:N-1
+    quat_KF(i,:) = kf.q;
     pos(i,:) = kf.p;
     vel(i,:) = kf.v;
+    err_q(i,:) = sqrt(diag(kf.P(1:3,1:3)));
     err_v(i,:) = sqrt(diag(kf.P(7:9,7:9)));
     err_p(i,:) = sqrt(diag(kf.P(4:6,4:6)));
 %     z=[angVelBody(i,:),accBody(i,:)].';
     z = [gyroReading(i,:),accReading(i,:)].';
+%     z = [angVelBody(i,:),accReading(i,:)].';
+    % z = [gyroReading(i,:),accBody(i,:)].';
+
     kf.propagate(z,dt);
-    R_gps = eye(3)*0.5;
-    z_gps(:,i) = positionNED(i,:).' + R_gps*randn(3,1);
-    kf.update(z_gps(:,i), R_gps);
+
+    % gps signal is fused with predicted position and attitude
+
+    z_gps(i+1,1:4) = compact(quatmultiply(quat_GT(i+1,:),...
+        exp(quaternion([0,randn(1,3)/2*sqrt(R_gps(1:3,1:3))]))));
+
+%     z_gps(i+1,1:4) = compact(quat_GT(i+1,:));
+
+    z_gps(i+1,5:7) = pos_GT(i+1,:) + transpose(sqrt(R_gps(4:6,4:6))*randn(3,1));
+%     z_gps(i+1,5:7) = pos_GT(i+1,:);
+    kf.update(z_gps(i+1,:), R_gps);
+    
 end
+quat_KF(end,:) = kf.q;
+quat_KF = quaternion(quat_KF);
+pos(end,:) = kf.p;
+vel(end,:) = kf.v;
+err_v(end,:) = sqrt(diag(kf.P(7:9,7:9)));
+err_p(end,:) = sqrt(diag(kf.P(4:6,4:6)));
 %%
+rms(accReading)/sqrt(kf.sa2)
+std(gyroReading)/sqrt(kf.sg2)
 
 %%
-% for i=1:100
-%     orientationNED(i)
-% end
-std(z_gps(index,:))
-std(pos(:,index))
+% quat2eul(quat_GT(end-10:end,:))/pi*180
+quat2eul(quaternion(z_gps(1:10,1:4)))/pi*180
+eul_GPS(1:10,:)
+%%
+% rms(eul_raw)
+% rms(eul_GPS)
+% rms(eul_KF)
+% std(quat2eul(quaternion(z_gps(:,1:4))))
+% std(eul_GPS)
+std(eul_KF)
+%%
+IMU.Gyroscope.NoiseDensity
+deg2rad(0.3)/3600 *1000
+%%
+kf.P(1:3,1:3)
+kf.sg2
+%%
+quat2eul(quaternion([1,err_q(9999,:)/2]))/pi*180
+std(eul_KF)
 %% Check if std converted by noise density equal to std
 % no, the former is 2/3 of the later.
 temp=IMU.Accelerometer.NoiseDensity*sqrt(fs)
@@ -97,187 +142,76 @@ temp=IMU.Accelerometer.NoiseDensity*sqrt(fs)
 std(accReading(:,3))
 % mean(acc(:,3))/2*10000
 % pos(end,3)
-%% plot imu
-f=figure(1);
-f.Position=[500 200 1600 900];
-subplot(2,1,1)
-plot(t,accReading)
-legend('X-axis','Y-axis','Z-axis')
-title('Accelerometer Readings')
-ylabel('Acceleration (m/s^2)')
-
-subplot(2,1,2)
-plot(t,gyroReading)
-legend('X-axis','Y-axis','Z-axis')
-title('Gyroscope Readings')
-ylabel('Angular Velocity (rad/s)')
 %%
-index=2;
+index=3;
 f=figure(2);
 
-f.Position=[500 200 1600 900];
+f.Position=[600 300 1600 900];
 
 % upper = vel+err_v;
 % lower = vel-err_v;
-
+% 
 % upper = pos+err_p;
 % lower = pos-err_p;
-% plot(t,z_gps(index,:));
+
+% data = [z_gps(:,5:7), pos_raw, pos, pos_GT] ;
+% legends = ["GPS","Raw","KF","Ground Truth"] ;
+
+% data = [z_gps(:,5:7), pos, pos_GT] ;
+% legends = ["GPS","KF","Ground Truth"] ;
+% 
+% YLabel = ["x-position","y-position","z-position"];
+
+% data = [z_gps(:,5:7) - pos_GT, pos - pos_GT];
+% legends = ["GPS","KF"];
+
+% upper = vel+err_v;
+% lower = vel-err_v;
 % hold on;
-% plot(t,positionRaw(:,index), 'LineWidth', 2);
-% plot(t,pos(:,index));
-% plot(t,positionNED(:,index), 'LineWidth', 2);
 
+% YLabel = ["x-velocity","y-velocity","z-velocity"];
+% 
+% data = [z_gps(:,5:7) - pos_GT, pos - pos_GT];
+% legends = ["GPS","KF"];
+
+% hold off
 % fill([t, fliplr(t)], [upper(:,index).', fliplr(lower(:,index).')], 'r', 'FaceAlpha', 0.3, 'EdgeColor', 'none');
-% hold off;
+
+% eul_GT = quat2eul(quat_GT)/pi*180;
+% eul_KF = quat2eul(quat_KF)/pi*180;
+% % eul_raw = quat2eul(quat_raw)/pi*180;
+% eul_GPS = quat2eul(quaternion(z_gps(:,1:4)))/pi*180;
+% legends = ["GPS","KF","GT"];
+% data = [eul_GPS,eul_KF,eul_GT];
+
+YLabel = ["heading","pitch","roll"];
+
+eul_KF = quat2eul(quatmultiply(quatconj(quat_KF),quat_GT))/pi*180;
+eul_raw = quat2eul(quatmultiply(quatconj(quat_raw),quat_GT))/pi*180;
+eul_GPS = quat2eul(quatmultiply(quatconj(quaternion(z_gps(:,1:4))),quat_GT))/pi*180;
+data = [eul_raw,eul_GPS, eul_KF];
+legends = ["raw","GPS","KF"];
+
+Plot(t, data, index, legends)
 xlabel('t (sec)',"FontSize",16)
-ylabel('y-position (m)',"FontSize",16)
-
-
-eul=quat2eul(orientationNED);
-plot(t,eul(:,1),'DisplayName','ground truth')
-hold on;
-eul=quat2eul(quaternion(quat));
-plot(t,eul(:,1),'DisplayName','KF')
-eul=quat2eul(orientationRaw);
-plot(t,eul(:,1),'--','DisplayName','Raw')
-hold off;
+ylabel(YLabel(index),"FontSize",16)
 legend("FontSize",18)
 ax = gca;
 ax.FontSize = 14;
 grid on;
-%%
-positionNED(1:10,2)
-pos(1:10,2)
-%% check if March_time is equivalent to kinematicTrajectory
-for i=1:N
-    if velocityNED(i,:)~=vel(i,:)
-        disp('no ');
-        break;
-    end
+% xlim([0,100])
+%% funct plot
+function Plot(t, data, index, legends)
+[~,col_num] = size(data);
+data_num = round(col_num/3);
+hold on;
+for i=1:data_num
+    plot(t, data(:,index),'DisplayName',legends(i))
+    index = index + 3;
 end
-i
-%% Kalman filter using the Kalman_Filter function
-L=13; %% length of the system state vector
-X=zeros(N,L);
-Xp=zeros(N,L);
-P_x=zeros(N,L);
-meas_cov=zeros(6,1);
-Q=zeros(L,1);
+hold off;
+end
 
-variance_theta=power(IMU.Gyroscope.NoiseDensity(1)*sqrt(fs)*dt,2);
-variance_acc=power(IMU.Accelerometer.NoiseDensity(1)*sqrt(fs)*dt,2);
-meas_cov(1:3,1)=variance_theta/dt;
-meas_cov(4:6,1)=variance_acc;
-meas_cov=diag(meas_cov);
-for i=1:N-1
-    z=[gyroReading(i+1,:),accReading(i+1,:)];
-    z=z.';
-    if i==1
-        X(1,1)=1;
-        X(1,11:13)=accReading(i,:);
-        theta=norm(z(1:3,1))*dt;
-        if theta~=0
-            vi=z(1,1)/theta*dt;
-            vj=z(2,1)/theta*dt;
-            vk=z(3,1)/theta*dt;
-        else
-            vi=0;
-            vj=0;
-            vk=0;
-        end
-        P_x(i,1)=sin(theta)^2*variance_theta;
-        P_x(i,2)=cos(theta)^2*variance_theta*vi;
-        P_x(i,3)=cos(theta)^2*variance_theta*vj;
-        P_x(i,4)=cos(theta)^2*variance_theta*vk;
-        P_x(i,5)=(variance_acc*dt^4)*5/4;
-        P_x(i,6)=P_x(i,5);
-        P_x(i,7)=P_x(i,5);
-        P_x(i,8)=variance_acc*dt^2;
-        P_x(i,9)=P_x(i,8);
-        P_x(i,10)=P_x(i,8);
-        P_x(i,11)=variance_acc;
-        P_x(i,12)=variance_acc;
-        P_x(i,13)=variance_acc;
-        P=diag(P_x(1,:));
-        Q=diag(Q);
-    end
-    [X(i+1,:),P,Xp(i,:)]=Kalman_Filter(z,X(i,:),P,meas_cov,Q,dt);
-    P_x(i+1,:)=diag(P);
-end
-%%
-[temp1,~,temp3]=Kalman_Filter(z,X(6,:),P,meas_cov,Q,dt)
-get_angle(quat2rotm(quaternion(temp1(1:4).')))/180*pi
-%% funct Kalman Filter
-function [X,P,Xp]=Kalman_Filter(z,X,P,meas_cov,Q,dt)
-w=z(1:3,1);
-w_norm=norm(w);
-if w_norm~=0
-    integrator0=quaternion(cos(w_norm/2*dt),w(1)/w_norm*sin(w_norm/2*dt),w(2)/w_norm*sin(w_norm/2*dt),w(3)/w_norm*sin(w_norm/2*dt));
-else
-    integrator0=quaternion(1,0,0,0);
-end
-[q1,q2,q3,q4]=parts(integrator0);
-A=zeros(13,13);
-A(1:4,1:4)=[q1,-q2,-q3,-q4;q2,q1,-q4,q3;q3,q4,q1,-q2;q4,-q3,q2,q1];
-for i=5:length(A)
-    A(i,i)=1;
-end
-for i=1:6
-    A(i+4,i+7)=dt;
-end
-for i=1:3
-    A(i+4,i+10)=dt*dt/2;
-end
-X=X.';
-Rotm=quat2rotm(quaternion(X(1,1),X(2,1),X(3,1),X(4,1)));
-X(11:13,1)=Rotm*z(4:6,1);
-
-Xp=A*X;
-get_angle(quat2rotm(quaternion(Xp(1:4,1).')))/180*pi;
-Pp=A*P*transpose(A) + Q;
-H=get_H(w*dt,Rotm);
-K=Pp*transpose(H)/(H*P*transpose(H)+meas_cov);
-v=Xp(2:4)/norm(Xp(2:4));
-rot_theta=atan2(norm(Xp(2:4)),Xp(1))*2;
-h_Xp=[v*rot_theta/dt;Rotm.'*Xp(11:13)];
-X=Xp+K*(z-h_Xp);
-X(1:4)=X(1:4)/norm(X(1:4));
-P=Pp-K*H*Pp;
-end
-%% funct get state to measurement matrix
-function H=get_H(theta_vec,Rotm)
-theta=norm(theta_vec);
-theta=theta/2;
-H=zeros(6,13);
-
-if theta~=0
-    vi=theta_vec(1)/theta;
-    vj=theta_vec(2)/theta;
-    vk=theta_vec(3)/theta;
-    H(1,1)=-vi/sin(theta);
-    H(1,2)=1/cos(theta);
-    H(1,3)=vi/vj/cos(theta);
-    H(1,4)=vi/vk/cos(theta);
-    H(2,1)=-vi/sin(theta);
-    H(2,2)=vj/vi/cos(theta);
-    H(2,3)=1/cos(theta);
-    H(2,4)=vj/vk/cos(theta);
-    H(3,1)=-vk/sin(theta);
-    H(3,2)=vk/vi/cos(theta);
-    H(3,3)=vk/vj/cos(theta);
-    H(3,4)=1/cos(theta);
-else
-%     vi=0;
-%     vj=0;
-%     vk=0;
-    H(1,2)=1;
-    H(2,3)=1;
-    H(3,4)=1;
-end
-H=H/2;
-H(4:6,11:13)=Rotm.';
-end
 %% funct march time
 function [q,r,v,a]=March_time(q0,v0,r0,accBody,w,dt)
 w_norm=norm(w);

@@ -32,7 +32,6 @@ classdef KF < handle
                 integrator0=quaternion(1,0,0,0);
             end
             quat = quatmultiply(quat, integrator0);
-%             quat = quatmultiply(integrator0, quat);
             rot1 = quat2rotm(quat);
             obj.x(1:4) = compact(quat);
             dR = rot1*transpose(rot);
@@ -52,14 +51,20 @@ classdef KF < handle
         end
         function update(obj, z, R) % this z is the measurement of GPS
             z = z.';
-            H = zeros(3,9);
-            H(:,4:6) = eye(3);
+            H = zeros(6,9);
+            H(1:3,1:3) = eye(3);
+            H(4:6,4:6) = eye(3);
             K = obj.P*H.'/(H*obj.P*H.' + R);
-            dx = K*(z-obj.p);
+            S = zeros(6,1);
+            theta_quat = log(quatmultiply(quatconj(quaternion(obj.x(1:4).')),quaternion(z(1:4).')));
+            theta = compact(theta_quat);
+            S(1:3) = theta(2:end) * 2; % X2 for the theta in quaternion is halved;
+            S(4:6) = z(5:7) - obj.x(5:7);
+            dx = K * S;
             dq = [1;dx(1:3)/2];
             dq = dq/norm(dq);
-            obj.x(1:4) = compact(quatmultiply(quaternion(dq.'),quaternion(obj.x(1:4).')));
-            % obj.x(1:4) = compact(quatmultiply(quaternion(obj.x(1:4).',quaternion(dq.'))));
+%             obj.x(1:4) = compact(quatmultiply(quaternion(dq.'),quaternion(obj.x(1:4).')));
+            obj.x(1:4) = compact(quatmultiply(quaternion(obj.x(1:4).'), quaternion(dq.')));
             obj.x(5:10) = obj.x(5:10) + dx(4:9);
             obj.P = obj.P - K*H*obj.P;
         end
