@@ -5,6 +5,8 @@ classdef KF < handle
         g;
         sa2; % sigma_a squared
         sg2; % sigma_g sqaured
+        ab; % acc bias
+        wb; % gyro bias
     end
     properties (Dependent)
         q;
@@ -18,10 +20,10 @@ classdef KF < handle
             w_norm=norm(w);
             quat = quaternion(obj.q.');
             rot = quat2rotm(quat);
-            obj.x(5:7) = obj.p + obj.v*dt - ...
+            obj.x(1:3) = obj.p + obj.v*dt - ...
                         obj.g*dt^2/2 ...;
                         + rot*a*dt^2/2;
-            obj.x(8:10) = obj.v - obj.g*dt + ...
+            obj.x(4:6) = obj.v - obj.g*dt + ...
                 rot*a*dt;
             if w_norm~=0
                 integrator0=quaternion(cos(w_norm/2*dt), ...
@@ -33,49 +35,47 @@ classdef KF < handle
             end
             quat = quatmultiply(quat, integrator0);
             rot1 = quat2rotm(quat);
-            obj.x(1:4) = compact(quat);
+            obj.x(7:10) = compact(quat);
             dR = rot1*transpose(rot);
             Phi = eye(9);
-            Phi(1:3,1:3) = dR.';
-            Phi(4:6,1:3) = -1/2*rot*skew(a*dt^2);
-            Phi(7:9,1:3) = -rot*skew(a*dt);
-            Phi(4:6,7:9) = eye(3)*dt;
+            Phi(1:3,4:6) = eye(3)*dt;
+            Phi(4:6,7:9) = -rot*skew(a)*dt;
+            Phi(7:9,7:9) = dR.';   
             G = zeros(9,6);
-            G(1:3,1:3) = -transpose(dR)*Jr(-w*dt)*dt;
-            G(4:6,4:6) = -1/2*rot*dt^2;
-            G(7:9,4:6) = -rot*dt;
+            G(4:6,1:3) = eye(3);
+            G(7:9,4:6) = eye(3);
             Q = eye(6,6);
-            Q(1:3,1:3) = Q(1:3,1:3)*obj.sg2;
-            Q(4:6,4:6) = Q(4:6,4:6)*obj.sa2;
+            Q(1:3,1:3) = Q(1:3,1:3)*obj.sa2*dt*dt;
+            Q(4:6,4:6) = Q(4:6,4:6)*obj.sg2*dt*dt;
             obj.P = Phi*obj.P*transpose(Phi) + G*Q*transpose(G);
         end
         function update(obj, z, R) % this z is the measurement of GPS
             z = z.';
             H = zeros(6,9);
             H(1:3,1:3) = eye(3);
-            H(4:6,4:6) = eye(3);
+            H(4:6,7:9) = eye(3);
             K = obj.P*H.'/(H*obj.P*H.' + R);
             S = zeros(6,1);
-            theta_quat = log(quatmultiply(quatconj(quaternion(obj.x(1:4).')),quaternion(z(1:4).')));
+            theta_quat = log(quatmultiply(quatconj(quaternion(obj.x(7:10).')),quaternion(z(4:7).')));
             theta = compact(theta_quat);
-            S(1:3) = theta(2:end) * 2; % X2 for the theta in quaternion is halved;
-            S(4:6) = z(5:7) - obj.x(5:7);
+            S(4:6) = theta(2:end) * 2; % X2 for the theta in quaternion is halved;
+            S(1:3) = z(1:3) - obj.x(1:3);
             dx = K * S;
-            dq = [1;dx(1:3)/2];
+            dq = [1;dx(7:9)/2];
             dq = dq/norm(dq);
-%             obj.x(1:4) = compact(quatmultiply(quaternion(dq.'),quaternion(obj.x(1:4).')));
-            obj.x(1:4) = compact(quatmultiply(quaternion(obj.x(1:4).'), quaternion(dq.')));
-            obj.x(5:10) = obj.x(5:10) + dx(4:9);
+%             obj.x(7:10) = compact(quatmultiply(quaternion(dq.'),quaternion(obj.x(7:10).')));
+            obj.x(7:10) = compact(quatmultiply(quaternion(obj.x(7:10).'), quaternion(dq.')));
+            obj.x(1:6) = obj.x(1:6) + dx(1:6);
             obj.P = obj.P - K*H*obj.P;
         end
         function val = get.q(obj)
-            val = obj.x(1:4);
+            val = obj.x(7:10);
         end
         function val = get.p(obj)
-            val = obj.x(5:7);
+            val = obj.x(1:3);
         end
         function val = get.v(obj)
-            val = obj.x(8:10);
+            val = obj.x(4:6);
         end
     end
 end
