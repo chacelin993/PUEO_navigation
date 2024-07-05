@@ -22,8 +22,8 @@ classdef KF < handle
             quat = quaternion(obj.q.');
             rot = quat2rotm(quat);
             obj.x(1:3) = obj.p + obj.v*dt + ...
-                        1/2*rot*(a+obj.g)*dt^2;
-            obj.x(4:6) = obj.v + (rot*(a) + obj.g)*dt;
+                        1/2*(rot*a+obj.g)*dt^2;
+            obj.x(4:6) = obj.v + (rot*a + obj.g)*dt;
 %             w_norm=norm(w);
 %             if w_norm~=0
 %                 integrator0=quaternion(cos(w_norm/2*dt), ...
