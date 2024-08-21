@@ -1,5 +1,5 @@
 %% IMU settings, calculate ground truth states
-fs = 500;
+fs = 10;
 IMU = imuSensor('accel-gyro','SampleRate',fs);
 g = 9.81 ;
 % acc_specs=accelparams('MeasurementRange', 15*g, ...
@@ -47,23 +47,30 @@ accReading(:,3)=accReading(:,3)-g;
 accReading=-accReading;
 traj = kinematicTrajectory('SampleRate',fs);
 [pos_GT,quat_GT,vel_GT,~,~] = traj(accBody,angVelBody);
-num_atna = 2;
+num_atna = 1;
 atna_GT = zeros(N,3,num_atna); % last index indicates antenna number
-atna_GT(1,:,1) = [3,0,3];  % defined in global coordinate, right above IMU
-atna_GT(1,:,2) = [0,0,3];
+atna_GT(1,:,1) = [0,0,3];  % defined in global coordinate, right above IMU
+atna_GT(1,:,2) = [3,0,0];  % vector from first atna to second, not position.
+% atna_GT(1,:,3) = [0,3,0];
 % atna_GT(1,:,3) = [-10,0,10];
 % atna_GT(1,:,3) = [0,-10,10];
 for j = 1:size(atna_GT,3)
-    for i = 1:N-1
-    atna_GT(i+1,:,j) = pos_GT(i+1,:) + (quat2rotm(quat_GT(i+1))*(atna_GT(1,:,j)-pos_GT(1,:)).').';
+    if j==1
+        for i = 1:N-1
+            atna_GT(i+1,:,j) = pos_GT(i+1,:) + ... 
+                (quat2rotm(quat_GT(i+1))*(atna_GT(1,:,j)-pos_GT(1,:)).').';
+        end
+    else
+        for i = 1:N-1
+            atna_GT(i+1,:,j) = (quat2rotm(quat_GT(i+1))*atna_GT(1,:,j).').';
+        end
     end
 end
 %%
-plot(t_GT, [atna_GT(:,3,1),pos_GT(:,3)])
+plot(t_GT, [atna_GT(:,:,2)])
 %%
-atna_GT(1,:,1).'
+atna_GT(1:10,:,2)
 %%
-plot(accBody(1:3141,2:3))
 %% Raw
 traj1 = kinematicTrajectory('SampleRate',fs);
 [pos_raw,quat_raw,vel_raw,~,~] = traj1(accReading,gyroReading);
@@ -192,10 +199,15 @@ kf.x=zeros(16+num_atna*3,1);
 kf.x(1:3) = pos_GT_l(1,:).'; % initial position
 kf.x(4:6) = vel_GT_l(1,:).';
 kf.x(7:10)=compact(quat_GT_l(1)).'; % initial attitude
-kf.atna_init_vec = zeros(3,num_atna) ;
-for i=1:num_atna
-    kf.atna_init_vec(:,i) = (quat2rotm(quat_GT_l(1)).')*(atna_GT_l(1,:,i)- pos_GT_l(1,:)).';
-    kf.x(16+(3*i-2):16+i*3) = atna_GT_l(1,:,i).';
+kf.atna_init_vec = zeros(3,1) ;
+for i=1:num_atna % Change Later
+    if i==1
+        kf.atna_init_vec(:,i) = (quat2rotm(quat_GT_l(1)).')*(atna_GT_l(1,:,i)- pos_GT_l(1,:)).';
+        kf.x(16+(3*i-2):16+i*3) = atna_GT_l(1,:,i).';
+    else
+        kf.atna_init_vec(:,i) = (quat2rotm(quat_GT_l(1)).')*(atna_GT_l(1,:,i)).';
+        kf.x(16+(3*i-2):16+i*3) = atna_GT_l(1,:,i).';
+    end
 end
 
 % kf.x(7:10) = compact(quaternion([cos(pi/6),sin(pi/6),0,0])).';
@@ -210,12 +222,15 @@ atna = zeros(N,3,num_atna);
 err_p=zeros(N,3); err_v=zeros(N,3); err_q=zeros(N,3);
 err_ab=zeros(N,3); err_wb=zeros(N,3);
 err_atna = zeros(N,3,num_atna);
-z_gps=zeros(N,3); % first 3 is position, last 4 is quaternion
-vel_GPS = zeros(N,3);
-R_gps = ones(3,1);
-R_gps(1:3) = power(0.5,2); % error in gps position
-% R_gps(4:6) = power(0.1/180*pi,2); % error in gps attitude 0.1 degrees
-R_gps = diag(R_gps);
+z_gps=zeros(N,3,num_atna);
+z_gps(1,:,1) = atna_GT_l(1,:,1);
+z_gps(1,:,2) = atna_GT_l(1,:,2);
+% vel_GPS = zeros(N,3,num_atna);
+R_gps = zeros(3,3,num_atna);
+R_gps(:,:,1) = eye(3)*power(0.5,2); % error in gps position
+% R_gps(:,:,2) = eye(3)*power(0.5,2);
+R_gps(:,:,2) = eye(3)*power(0.1/180*pi,2); % error in gps attitude 0.1 degrees
+% R_gps(:,:,3) = eye(3)*power(0.1/180*pi,2);
 bias_a = zeros(N,3); bias_w = zeros(N,3);
 
 for i=1:N-1
@@ -227,7 +242,6 @@ for i=1:N-1
     err_q(i,:) = sqrt(diag(kf.P(7:9,7:9))); 
     err_ab(i,:) = sqrt(diag(kf.P(10:12,10:12)));
     err_wb(i,:) = sqrt(diag(kf.P(13:15,13:15)));
-    
     bias_a(i,:) = kf.ab;
     bias_w(i,:) = kf.wb;
     for k=1:num_atna
@@ -240,15 +254,16 @@ for i=1:N-1
     % gps signal is fused with predicted position and attitude
     if rem(i, IMU2GPS_fratio) ==0
         for k=1:num_atna
-            z_gps(i+1,1:3) = atna_GT_l(i+1,:,k)+ transpose(sqrt(R_gps(1:3,1:3))*randn(3,1));
-            kf.update(z_gps(i+1,:), R_gps,"GPS",k);
+            z_gps(i+1,1:3,k) = atna_GT_l(i+1,:,k) + transpose(sqrt(R_gps(1:3,1:3,k))*randn(3,1));
+            kf.update(z_gps(i+1,:,k), R_gps(:,:,k),"GPS",k);
+%             kf.update(atna_GT_l(i+1,:,k), R_gps(:,:,k),"GPS",k);
         end
 %         z_gps(i+1,4:7) = compact(quatmultiply(quat_GT_l(i+1,:),...
 %             exp(quaternion([0,randn(1,3)/2*sqrt(R_gps(4:6,4:6))]))));
     end
 end
 disp("done KF "+ j)
-z_gps(i+1,:) = atna_GT_l(i+1,:,k)+ transpose(sqrt(R_gps(1:3,1:3))*randn(3,1));
+z_gps(i+1,:,1) = atna_GT_l(i+1,:,1)+ transpose(sqrt(R_gps(1:3,1:3,1))*randn(3,1));
 % non_zero_rows = ~all(z_gps==0,2);
 % z_gps = z_gps(non_zero_rows,:);
 % t_gps = t(non_zero_rows);
@@ -292,11 +307,18 @@ title('Allan Deviation of Accelerometer');
 grid on;
 
 %%
-plot(t,[atna(:,:,3)-atna_GT_l(:,:,3)])
+index=3;
+eul_GT=quat2eul(quat_GT_l);
+plot(t,[atna(:,index,2)-atna_GT_l(:,index,2),eul_GT(:,index)])
+% plot(t,[vecnorm(atna(:,:,2),2,2)-3])
+% plot(t,[eul_GT])
 % xlim([1,10])
+% std(atna(:,:,2))
 %%
-plot(t,vecnorm(atna(:,:,1)-pos,2,2))
-
+std(z_gps(:,:,2)-atna_GT_l(:,:,2))
+% plot(t,vecnorm(atna(:,:,1)-pos,2,2))
+%%
+err_atna(100:150,:,2)
 %%
 plot(t,[quat2eul([ones(N,1),err_q/2])/pi*180])
 grid on;
@@ -313,11 +335,13 @@ mean(err_eul)
 % quat2eul([ones(N,1),err_q/2])/pi*180
 %%
 std(pos-pos_GT_l)
-mean(err_p)
+std(atna(:,1:3,1)-atna_GT_l(:,1:3,1))
+% mean(err_p)
 %%
-std(atna(:,:,1)-atna_GT_l(:,:,1))
+std(atna(:,:,2)-atna_GT_l(:,:,2))
 %%
-plot(t,[gyroReading(:,3),bias_w(:,3)])
+atna(9990:10000,:,1)
+atna_GT_l(9990:10000,:,1)
 %%
 std_p
 mean_err_p
@@ -355,7 +379,7 @@ zlabel('Height',"FontSize",30);
 ax = gca;
 ax.FontSize = 20;
 %% Plot
-index=1;
+index=2;
 f=figure(2);
 
 f.Position=[600 300 1200 900];
@@ -366,19 +390,18 @@ errbar_legend=[];
 
 % data = [pos, pos_GT_l] ;
 % errbar = [pos_GT_l+err_p,pos_GT_l-err_p];
-
 % errbar_legend=sprintf("Mean Error: %0.3f",mean(err_p(:,index)));
 % legends = ["EKF","Ground Truth",errbar_legend] ;
 % YLabel = ["x-position","y-position (m)","z-position (m)"];
 
 % Position Error plot
-data = err_p;
-legends = ["X","Y","Z"] ;
-YLabel = ["x-position difference","y-position difference","z-position difference"];
-data = [pos - pos_GT_l];
-errbar = [err_p, -err_p];
-errbar_legend=sprintf("Mean Error: %0.3f",mean(err_p(:,index)));
-legends = [errbar_legend,"EKF"];
+% data = err_p;
+% legends = ["X","Y","Z"] ;
+% YLabel = ["x-position difference","y-position difference","z-position difference"];
+% data = [pos - pos_GT_l];
+% errbar = [err_p, -err_p];
+% errbar_legend=sprintf("Mean Error: %0.3f",mean(err_p(:,index)));
+% legends = [errbar_legend,"EKF"];
 
 % data = [vel, vel_GT ];
 % legends = ["EKF","GT"];
@@ -404,12 +427,12 @@ legends = [errbar_legend,"EKF"];
 % YLabel = ["Error in Attitude","Error in Attitude","Error in Attitude"];
 
 
-% eul_KF = quat2eul(quatmultiply(quatconj(quat_KF),quat_GT_l))/pi*180;
-% data = [eul_KF];
-% errbar = [err_eul, -err_eul];
-% errbar_legend=sprintf("Mean Error: %0.3f",mean(err_eul(:,index)));
-% legends = [errbar_legend,"EKF"];
-% YLabel = ["heading difference","pitch difference","roll difference"] ;
+eul_KF = quat2eul(quatmultiply(quatconj(quat_KF),quat_GT_l))/pi*180;
+data = [eul_KF];
+errbar = [err_eul, -err_eul];
+errbar_legend=sprintf("Mean Error: %0.3f",mean(err_eul(:,index)));
+legends = [errbar_legend,"EKF"];
+YLabel = ["heading difference","pitch difference","roll difference"] ;
 
 %  with raw
 % eul_KF = quat2eul(quatmultiply(quatconj(quat_KF),quat_GT_l))/pi*180;
@@ -518,14 +541,14 @@ angVelBody=zeros(N,3);
 % disp("SetTrueIMUSignal: spin around x")
 
 % slow motion
-accBody(:,1) = 0.1*sin(2*pi/6000*t);
-accBody(:,2) = 0.1*cos(2*pi/6000*t);
-accBody(:,3) = 0.05*sin(2*pi/1000*t)+0.05*sin(2*pi/200*t);
+% % accBody(:,1) = 0.1*sin(2*pi/6000*t);
+% % accBody(:,2) = 0.1*cos(2*pi/6000*t);
+% % accBody(:,3) = 0.05*sin(2*pi/1000*t)+0.05*sin(2*pi/200*t);
 
 angVelBody(:,3) = 0.2*sin(2*pi/100*t)+0.4*sin(2*pi/5000*t); % T=115.2s/5184s
 angVelBody(:,2) = 0.001*sin(2*pi/1200*t);
 angVelBody(:,1) = 0.001*sin(2*pi/1200*t);
-disp("SetTrueIMUSignal: slow motion");
+% disp("SetTrueIMUSignal: slow motion");
 
 % fast motion, IMU sampling frequency needs to be big enough to get right
 % estimation
@@ -550,8 +573,9 @@ disp("SetTrueIMUSignal: slow motion");
 % end
 % disp("SetTrueIMUSignal: pendulum motion")
 
-% accBody(:,1) = 0.1;
-% % angVelBody(:,1) = 0.1;
+% accBody(:,1) = 10;
+% angVelBody(:,1) = 0.1;
+% angVelBody(:,2) = 0.1;
 % angVelBody(:,3) = 0.1;
 end
 %% funct plot
@@ -579,6 +603,27 @@ end
 hold off;
 legend(legends);
 end
+%%
+% function R_gps=z_atna_cov(quat,atna,pos_err, angle_err)
+% % input: current attitude; initial atna vector in local frame.
+% % uncertainty in main antenna position
+% % uncertainty in pointing angle in radians
+% num_atna = size(atna,2);
+% l = atna(:,2)-atna(:,1);
+% l = quat2rotm(quat)*l;
+% [phi,el,r]=cart2sph(l(1),l(2),l(3));
+% theta = pi/2 - el;
+% R_gps = eye(num_atna*3);
+% R_gps(1:3,1:3) = R_gps(1:3,1:3)*pos_err^2;
+% e11=1+cos(2*(theta+phi)); e12=sin(2*(theta+phi)); e13=sin(phi)-sin(2*theta+phi);
+% e21=sin(2*(theta+phi)); e22=1-cos(2*(theta+phi)); e23=-cos(phi)+cos(2*(theta+phi));
+% e31=sin(phi)-sin(2*(theta+phi)); e32=-cos(phi)+cos(2*(theta+phi)); e33=2*sin(theta)^2;
+% cov=[e11,e12,e13;e21,e22,e23;e31,e32,e33];
+% % R_gps(1:3,4:6) = R_gps(1:3,1:3);
+% % R_gps(4:6,1:3) = R_gps(1:3,4:6).';
+% % R_gps(4:6,4:6) = R_gps(1:3,1:3) + norm(l)^2 * angle_err^2/2 * cov;
+% R_gps(4:6,4:6) = R_gps(1:3,1:3);
+% end
 %% funct quaternion interpolation
 function qi = Slerp(t1, q, t2)
 % frac = zeros(length(t2));
